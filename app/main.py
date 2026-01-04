@@ -18,6 +18,14 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown
 
+
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
 settings = get_settings()
 app = FastAPI(
     title=settings.PROJECT_NAME,

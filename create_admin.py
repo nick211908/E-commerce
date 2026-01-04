@@ -7,8 +7,21 @@ async def create_admin():
     print("Initializing database connection...")
     await init_db()
     
-    email = "pandeyayush4101@gmail.com"
-    password = "ayush@123"
+    import os
+    email = os.getenv("ADMIN_EMAIL", "pandeyayush4101@gmail.com")
+    
+    # Securely get password
+    env_password = os.getenv("ADMIN_PASSWORD")
+    if env_password:
+        password = env_password
+    else:
+        # Fallback to input if running interactively, else error or use a secure default if really needed (not recommended)
+        try:
+            from getpass import getpass
+            password = getpass(f"Enter password for {email}: ")
+        except:
+             print("Error: ADMIN_PASSWORD environment variable not set and non-interactive mode.")
+             return
     
     print(f"Checking for existing admin user: {email}")
     # Check if exists

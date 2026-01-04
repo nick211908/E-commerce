@@ -6,6 +6,11 @@ from app.auth.dependencies import get_current_active_user, User
 from typing import List
 from pydantic import BaseModel
 
+from decimal import Decimal
+import logging
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 class OrderCreate(BaseModel):
@@ -26,106 +31,102 @@ async def create_order(
     order_in: OrderCreate,
     user: User = Depends(get_current_active_user)
 ):
-    # 1. Fetch Cart
-    cart = await Cart.find_one(Cart.user_id == user.id)
-    if not cart or not cart.items:
-        raise HTTPException(status_code=400, detail="Cart is empty")
+    # Start Transaction
+    # note: Transactions require a MongoDB Replica Set
+    client = Order.get_motor_client()
+    async with client.start_session() as session:
+        async with session.start_transaction():
+            try:
+                # 1. Fetch Cart
+                cart = await Cart.find_one(Cart.user_id == user.id, session=session)
+                if not cart or not cart.items:
+                    raise HTTPException(status_code=400, detail="Cart is empty")
 
-    order_items = []
-    total_amount = 0
-    reserved_items = []
+                order_items = []
+                total_amount = Decimal("0.00")
+                
+                # 2. Process Items & Reserve Stock
+                for item in cart.items:
+                    # using config.get_settings().MONGO_URI might be needed if client is lost, but get_motor_client works
+                    product = await Product.get(item.product_id, session=session)
+                    if not product:
+                        raise HTTPException(status_code=400, detail=f"Product {item.product_id} not found")
+                    
+                    variant = next((v for v in product.variants if v.sku == item.variant_sku), None)
+                    if not variant:
+                        raise HTTPException(status_code=400, detail=f"Variant {item.variant_sku} not found")
 
-    # 2. Process Items & Reserve Stock
-    try:
-        for item in cart.items:
-            product = await Product.get(item.product_id)
-            if not product:
-                raise HTTPException(status_code=400, detail=f"Product {item.product_id} not found")
-            
-            variant = next((v for v in product.variants if v.sku == item.variant_sku), None)
-            if not variant:
-                raise HTTPException(status_code=400, detail=f"Variant {item.variant_sku} not found")
+                    # Atomic Decrement with session
+                    result = await Product.find_one(
+                        Product.id == product.id,
+                        {"variants": {"$elemMatch": {"sku": item.variant_sku, "stock_quantity": {"$gte": item.quantity}}}}
+                    , session=session).update(
+                        {"$inc": {"variants.$.stock_quantity": -item.quantity}},
+                        session=session
+                    )
 
-            # Atomic Decrement
-            # Filter matches: ID, SKU, and Stock >= Qty
-            result = await Product.find_one(
-                Product.id == product.id,
-                {"variants": {"$elemMatch": {"sku": item.variant_sku, "stock_quantity": {"$gte": item.quantity}}}}
-            ).update(
-                {"$inc": {"variants.$.stock_quantity": -item.quantity}}
-            )
+                    if result.modified_count == 0:
+                        raise HTTPException(status_code=409, detail=f"Insufficient stock for {product.title} ({variant.size}/{variant.color})")
+                    
+                    # Calculate Price
+                    # Convert float base_price to Decimal if needed, though model says DecimalAnnotation
+                    # assuming it acts like Decimal or float compatible
+                    price = Decimal(str(product.base_price)) + Decimal(str(variant.price_adjustment))
+                    total_amount += price * Decimal(item.quantity)
 
-            if result.modified_count == 0:
-                raise HTTPException(status_code=409, detail=f"Insufficient stock for {product.title} ({variant.size}/{variant.color})")
-            
-            # Record reservation for rollback
-            reserved_items.append({
-                "product_id": product.id,
-                "variant_sku": item.variant_sku,
-                "quantity": item.quantity
-            })
+                    # Add to Order Items (Snapshot)
+                    order_items.append(OrderItem(
+                        product_id=product.id,
+                        variant_sku=item.variant_sku,
+                        title=product.title,
+                        size=variant.size,
+                        color=variant.color,
+                        unit_price=float(price), # Store as float for simple JSON serialization if needed
+                        quantity=item.quantity
+                    ))
 
-            # Calculate Price
-            price = product.base_price + variant.price_adjustment
-            total_amount += price * item.quantity
+                # 3. Create Stripe Payment Intent (External Call - keep outside transaction risk or handle carefully)
+                # Ideally, we should create the intent *before* committing stock changes permanently or handle failures.
+                # However, since we are in a transaction, if stripe fails, we abort and stock is safe.
+                amount_cents = int(float(total_amount) * 100)
+                
+                try:
+                    intent = stripe.PaymentIntent.create(
+                        amount=amount_cents,
+                        currency="usd",
+                        metadata={"user_id": str(user.id)},
+                        automatic_payment_methods={"enabled": True},
+                    )
+                except Exception as e:
+                    logger.error(f"Stripe Error: {e}")
+                    raise HTTPException(status_code=500, detail=f"Payment Gateway Error")
 
-            # Add to Order Items (Snapshot)
-            order_items.append(OrderItem(
-                product_id=product.id,
-                variant_sku=item.variant_sku,
-                title=product.title,
-                size=variant.size,
-                color=variant.color,
-                unit_price=price,
-                quantity=item.quantity
-            ))
+                # 4. Create Order
+                order = Order(
+                    user_id=user.id,
+                    status=OrderStatus.PENDING,
+                    items=order_items,
+                    total_amount=float(total_amount),
+                    shipping_address=order_in.shipping_address,
+                    payment_intent_id=intent.id
+                )
+                await order.insert(session=session)
+                
+                # 5. Clear Cart
+                await cart.delete(session=session)
+                
+                # Update metadata
+                stripe.PaymentIntent.modify(
+                    intent.id,
+                    metadata={"order_id": str(order.id)}
+                )
+                
+                return CreateOrderResponse(order=order, client_secret=intent.client_secret)
 
-        # 3. Create Stripe Payment Intent
-        # Stripe expects amount in cents
-        amount_cents = int(total_amount * 100)
-        
-        try:
-            intent = stripe.PaymentIntent.create(
-                amount=amount_cents,
-                currency="usd",
-                metadata={"user_id": str(user.id)},
-                automatic_payment_methods={"enabled": True},
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Stripe Error: {str(e)}")
-
-        # 4. Create Order
-        order = Order(
-            user_id=user.id,
-            status=OrderStatus.PENDING,
-            items=order_items,
-            total_amount=total_amount,
-            shipping_address=order_in.shipping_address,
-            payment_intent_id=intent.id
-        )
-        await order.insert()
-        
-        # Update metadata with order_id after creation
-        stripe.PaymentIntent.modify(
-            intent.id,
-            metadata={"order_id": str(order.id)}
-        )
-
-        # 5. Clear Cart
-        await cart.delete()
-        
-        return CreateOrderResponse(order=order, client_secret=intent.client_secret)
-
-    except Exception as e:
-        # Rollback Inventory
-        for res in reserved_items:
-            await Product.find_one(
-                Product.id == res["product_id"],
-                {"variants.sku": res["variant_sku"]}
-            ).update(
-                {"$inc": {"variants.$.stock_quantity": res["quantity"]}}
-            )
-        raise e
+            except Exception as e:
+                logger.error(f"Order creation failed: {e}")
+                # Transaction will automatically abort when existing 'async with session.start_transaction()' block with error
+                raise e
 
 @router.get("/", response_model=List[Order])
 async def list_orders(user: User = Depends(get_current_active_user)):

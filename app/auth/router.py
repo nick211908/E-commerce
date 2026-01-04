@@ -28,16 +28,32 @@ class UserResponse(BaseModel):
 # Routes
 @router.post("/register", response_model=UserResponse)
 async def register(user_in: UserCreate):
+    # Verification: Check password strength
+    if len(user_in.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long")
+    if not any(char.isdigit() for char in user_in.password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one number")
+    if not any(char.isupper() for char in user_in.password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one uppercase letter")
+
     existing_user = await User.find_one(User.email == user_in.email)
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
+    # Future: Send verification email here
+    # user_in.is_active = False # Require email check?
+    
     user = User(
         email=user_in.email,
         password_hash=get_password_hash(user_in.password),
-        full_name=user_in.full_name
+        full_name=user_in.full_name,
+        # is_active=False # Uncomment if implementing email verification flow
     )
     await user.insert()
+    
+    # Simulate verification email sent log
+    # logger.info(f"Verification email sent to {user.email}")
+
     return UserResponse(
         id=str(user.id),
         email=user.email,

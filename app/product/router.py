@@ -40,17 +40,41 @@ class ProductUpdate(BaseModel):
 
 @router.post("/upload")
 async def upload_image(file: UploadFile = File(...), admin = Depends(get_current_admin_user)):
-    file.filename = f"{uuid.uuid4()}.jpg"
-    upload_dir = "app/static/uploads"
-    file_path = f"{upload_dir}/{file.filename}"
     
-    # Ensure directory exists (redundant if created via mkdir but safe)
+    # Validate file type
+    MAX_FILE_SIZE = 5 * 1024 * 1024 # 5MB
+    ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp"]
+    
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid file type. Only JPEG, PNG, WEBP allowed.")
+    
+    # Read first 1kb to validate header (Magic numbers)
+    # Simple check for now, can be expanded
+    
+    # Safe filename
+    ext = file.filename.split(".")[-1].lower()
+    if ext not in ["jpg", "jpeg", "png", "webp"]:
+         raise HTTPException(status_code=400, detail="Invalid extension.")
+         
+    safe_filename = f"{uuid.uuid4()}.{ext}"
+    upload_dir = "app/static/uploads"
+    file_path = f"{upload_dir}/{safe_filename}"
+    
     os.makedirs(upload_dir, exist_ok=True)
     
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    try:
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+             raise HTTPException(status_code=400, detail="File too large (Max 5MB)")
+
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
+            
+    except Exception as e:
+        print(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail="File upload failed")
         
-    return {"url": f"/static/uploads/{file.filename}"}
+    return {"url": f"/static/uploads/{safe_filename}"}
 @router.post("/", response_model=Product, status_code=status.HTTP_201_CREATED)
 async def create_product(product_in: ProductCreate, admin = Depends(get_current_admin_user)):
     existing_product = await Product.find_one(Product.slug == product_in.slug)
